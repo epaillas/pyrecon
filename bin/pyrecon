@@ -349,7 +349,8 @@ def main(args=None, **input_config):
     if 'randoms' in output_fns:
         # RSD removal only: no effect on the randoms
         if convention == 'rsd':
-            positions_rec['randoms'] = positions['randoms']
+            idx = np.random.choice(len(positions['randoms']), size=len(positions['randoms']), replace=False)
+            positions_rec['randoms'] = positions['randoms'] - recon.read_shifts(positions['randoms'], field=field)[idx]
         else:
             # convention == recsym: move randoms by Zeldovich + RSD displacement
             # convention == reciso: move randoms by Zeldovich displacement
