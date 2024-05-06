@@ -8,7 +8,7 @@ import numpy as np
 from pmesh.pm import ParticleMesh
 
 from .mesh import _get_mesh_attrs, _get_resampler, _wrap_positions
-from .utils import BaseClass
+from .utils import BaseClass, cartesian_to_sky
 from . import utils, mpi
 
 
@@ -196,7 +196,7 @@ class BaseReconstruction(BaseClass):
         return nmesh.copy()
 
     def __init__(self, f=None, bias=None, los=None, nmesh=None, boxsize=None, boxcenter=None, cellsize=None, boxpad=2., wrap=False,
-                 data_positions=None, randoms_positions=None, data_weights=None, randoms_weights=None,
+                 data_positions=None, randoms_positions=None, data_weights=None, randoms_weights=None, growth_at_dist=None,
                  positions=None, position_type='pos', resampler='cic', decomposition=None, fft_plan='estimate', dtype='f8', mpiroot=None, mpicomm=mpi.COMM_WORLD, **kwargs):
         """
         Initialize :class:`BaseReconstruction`.
@@ -281,8 +281,6 @@ class BaseReconstruction(BaseClass):
         self.wrap = bool(wrap)
         self.rdtype = _get_real_dtype(dtype)
         self.dtype = np.dtype(dtype) if self._compressed else 'c{:d}'.format(2 * self.rdtype.itemsize)
-        self.f = f
-        self.bias = bias
         positions = _format_positions(positions, position_type=self.position_type, dtype=self.rdtype, copy=True, mpicomm=self.mpicomm, mpiroot=self.mpiroot)
         data_positions = _format_positions(data_positions, position_type=self.position_type, dtype=self.rdtype, copy=True, mpicomm=self.mpicomm, mpiroot=self.mpiroot)
         randoms_positions = _format_positions(randoms_positions, position_type=self.position_type, dtype=self.rdtype, copy=True, mpicomm=self.mpicomm, mpiroot=self.mpiroot)
@@ -294,6 +292,16 @@ class BaseReconstruction(BaseClass):
         self.set_los(los)
         if self.mpicomm.rank == 0:
             self.log_info('Using mesh with nmesh={}, boxsize={}, boxcenter={}.'.format(self.nmesh, self.boxsize, self.boxcenter))
+        if f == 'mesh':
+            if type(self).__name__ != 'IterativeFFTReconstruction':
+                raise ValueError('f = "mesh" only available for IterativeFFTReconstruction')
+            if growth_at_dist is None:
+                raise ValueError('Provide growth_at_dist')
+            self.f = self.set_growth_mesh(growth_at_dist) 
+        else:
+            self.f = f
+        self.bias = bias
+        self.growth_at_dist = growth_at_dist
         if data_positions is not None:
             data_weights = _format_weights(data_weights, size=len(data_positions), copy=True, mpicomm=self.mpicomm, mpiroot=self.mpiroot)
             self.assign_data(data_positions, data_weights, position_type='pos', copy=False, mpiroot=None)
@@ -336,6 +344,52 @@ class BaseReconstruction(BaseClass):
             raise ValueError('Provide f')
         if self.bias is None:
             raise ValueError('Provide bias')
+
+    def _lattice_positions(self):
+        boxcenter = self.boxcenter
+        boxsize = self.boxsize
+        cellsize = self.boxsize / self.nmesh
+        xedges = np.arange(boxcenter[0] - boxsize[0]/2, boxcenter[0] + boxsize[0]/2 + cellsize[0], cellsize[0])
+        yedges = np.arange(boxcenter[1] - boxsize[1]/2, boxcenter[1] + boxsize[1]/2 + cellsize[1], cellsize[1])
+        zedges = np.arange(boxcenter[2] - boxsize[2]/2, boxcenter[2] + boxsize[2]/2 + cellsize[2], cellsize[2])
+        xcentres = 1/2 * (xedges[:-1] + xedges[1:])
+        ycentres = 1/2 * (yedges[:-1] + yedges[1:])
+        zcentres = 1/2 * (zedges[:-1] + zedges[1:])
+        lattice_x, lattice_y, lattice_z = np.meshgrid(xcentres, ycentres, zcentres, indexing='ij')
+        lattice_x = lattice_x.flatten()
+        lattice_y = lattice_y.flatten()
+        lattice_z = lattice_z.flatten()
+        return np.c_[lattice_x, lattice_y, lattice_z]
+
+    def set_growth_mesh(self, growth_at_dist):
+        if self.mpicomm.rank == 0:
+            self.log_info('Setting mesh of growth rate values.')
+            lattice_positions = self._lattice_positions()
+            lattice_weights = growth_at_dist(utils.distance(lattice_positions))
+        else:
+            lattice_positions = None
+            lattice_weights = None
+        lattice_positions = _format_positions(lattice_positions, position_type='pos', dtype=self.rdtype, copy=True, mpicomm=self.mpicomm, mpiroot=0)
+        lattice_weights = _format_weights(lattice_weights, size=len(lattice_positions), copy=True, mpicomm=self.mpicomm, mpiroot=0)
+        mesh_growth = self.pm.create('real', value=0)
+        self._paint(lattice_positions, weights=lattice_weights, out=mesh_growth)
+        return mesh_growth.value
+        
+    def set_optimal_weights(self, n_at_dist, P0):
+        if self.mpicomm.rank == 0:
+            self.log_info('Setting optimal weights.')
+            lattice_positions = self._lattice_positions()
+            n = n_at_dist(utils.distance(lattice_positions))
+            lattice_weights = n * P0 / (1 + n * P0)
+        else:
+            lattice_positions = None
+            lattice_weights = None
+        lattice_positions = _format_positions(lattice_positions, position_type='pos', dtype=self.rdtype, copy=True, mpicomm=self.mpicomm, mpiroot=0)
+        lattice_weights = _format_weights(lattice_weights, size=len(lattice_positions), copy=True, mpicomm=self.mpicomm, mpiroot=0)
+        mesh_weights = self.pm.create('real', value=0)
+        self._paint(lattice_positions, weights=lattice_weights, out=mesh_weights)
+        self.mesh_delta *= mesh_weights.value
+        return
 
     def set_los(self, los=None):
         """
@@ -599,10 +653,16 @@ class BaseReconstruction(BaseClass):
             los = utils.safe_divide(positions, utils.distance(positions)[:, None])
         else:
             los = self.los.astype(shifts.dtype)
-        rsd = self.f * np.sum(shifts * los, axis=-1)[:, None] * los
+        if np.isscalar(self.f):
+            f = self.f
+        else:
+            dist = utils.distance(positions)
+            f = self.growth_at_dist(dist)
+            f = np.c_[f, f, f]
+        rsd = f * (np.sum(shifts * los, axis=-1)[:, None] * los)
         if field == 'rsd':
             return rsd
-        # field == 'disp+rsd'
+        field == 'disp+rsd'
         shifts += rsd
         return shifts
 
